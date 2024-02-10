@@ -29,7 +29,7 @@ emb_file_name = "/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/poi_embeddi
 embedding_size = 64
 emb = torch.load(emb_file_name)
 #poi_csv = pd.read_csv("/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/POI_ZoneID_NRW_updated.csv", encoding='utf-8')
-poi_csv = pd.read_csv("/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/POI_ZoneID_NYC.csv", encoding='utf-8')
+poi_csv = pd.read_csv("/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/POI_ZoneID_NYC.csv", encoding='utf-8')
 zone_list = []
 poi_zone_grouped = poi_csv.groupby(['ZoneID'])
 
