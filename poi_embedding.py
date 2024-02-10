@@ -11,14 +11,10 @@ from torch_geometric.utils import to_dense_adj
 from sklearn.metrics.pairwise import cosine_similarity
 import sys
 
-#edge_weights_file_distance = '/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/new_data/nyc_distance_edge_weights.csv'
-#edge_weights_file_category = '/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/new_data/nyc_category_edge_weights.csv'
-#poi_file = '/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/POI_ZoneID_NYC.csv'
+edge_weights_file_distance = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_distance_edge_weights.csv'
+edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights.csv'
+poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/POI_ZoneID_NYC.csv'
 
-
-edge_weights_file_distance = '/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/new_data/nrw_distance_edge_weights.csv'
-edge_weights_file_category = '/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/new_data/nrw_category_edge_weights.csv'
-poi_file = '/home/iailab41/sheikhz0/Semantics-preserved-POI-embedding/Data/POI_ZoneID_NRW_updated.csv'
 
 def create_weight_adj_matrix(edge_file):
     df = pd.read_csv(edge_file)
