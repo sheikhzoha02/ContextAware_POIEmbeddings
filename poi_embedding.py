@@ -10,11 +10,25 @@ from torch_geometric.utils import train_test_split_edges
 from torch_geometric.utils import to_dense_adj
 from sklearn.metrics.pairwise import cosine_similarity
 import sys
+import ast
+from torch import Tensor
+from typing import Optional
+from Module.InnerProductDecoderClass import InnerProductDecoder
+from torch_geometric.utils import negative_sampling
+
 
 edge_weights_file_distance = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_distance_edge_weights.csv'
 edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights.csv'
-poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/POI_ZoneID_NYC.csv'
+poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_1.csv'
 
+
+def get_geohash(latitude, longitude, precision=12):
+    return geohash2.encode(latitude, longitude, precision=precision)
+
+def char2vec_conversion(words):
+    c2v_model = chars2vec.load_model('eng_50')
+    word_embeddings = c2v_model.vectorize_words(words)
+    return word_embeddings
 
 def create_weight_adj_matrix(edge_file):
     df = pd.read_csv(edge_file)
@@ -65,31 +79,31 @@ def normalize_edge_weights(edge_weights_array):
 def generate_data_model(edge_index,edge_weight,poi_file,graph_type):
     data_poi = pd.read_csv(poi_file)
     if graph_type == 'category':
-        features = ['index', 'FirstLevel','SecondLeve']
+        data_list_fclass = [ast.literal_eval(s) for s in data_poi['fclass_embedding'].values]
+        numpy_data_fclass = np.array(data_list_fclass, dtype=np.float32)
+        data_list_1stlevel = [ast.literal_eval(s) for s in data_poi['1stlevel_embedding'].values]
+        numpy_data_1stlevel = np.array(data_list_1stlevel, dtype=np.float32)
+        numpy_data = np.concatenate((numpy_data_fclass, numpy_data_1stlevel), axis=1)
+        node_features = torch.tensor(numpy_data, dtype=torch.float)
     elif graph_type == 'distance':
-        features = ['index','Lon','Lat']
+        data_list = [ast.literal_eval(s) for s in data_poi['geohash_embedding'].values]
+        numpy_data = np.array(data_list, dtype=np.float32)
+        node_features = torch.tensor(numpy_data)
 
-    #features normalization
-    node_features = torch.tensor(data_poi[features].values).to(torch.float32)
-    mean_vals = node_features.mean(dim=0)
-    std_vals = node_features.std(dim=0)
-    normalized_features_category_graph = (node_features - mean_vals) / std_vals
-
-    node_features_np = normalized_features_category_graph
-    num_features = node_features_np.shape[1]
     desired_dimensions = 64
+    num_features = node_features.shape[1]
     if num_features < desired_dimensions:
-        padding = np.zeros((node_features_np.shape[0], desired_dimensions - num_features))
-        node_features_np = np.concatenate((node_features_np, padding), axis=1)
+        padding = np.zeros((node_features.shape[0], desired_dimensions - num_features))
+        node_features = np.concatenate((node_features, padding), axis=1)
+        node_features = torch.tensor(node_features, dtype=torch.float)
 
-    node_features = torch.tensor(node_features_np, dtype=torch.float)
     data = Data(x=node_features, edge_index=edge_index, edge_weight=edge_weight)
     return data
 
 class GATLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, heads=1):
+    def __init__(self, in_channels, out_channels, heads=1, dropout=0.5):
         super(GATLayer, self).__init__()
-        self.conv = GATConv(in_channels, out_channels, heads=heads)
+        self.conv = GATConv(in_channels, out_channels, heads=heads, dropout=dropout)
 
     def forward(self, x, edge_index, edge_weight):
         x = self.conv(x, edge_index, edge_weight)
@@ -97,9 +111,9 @@ class GATLayer(nn.Module):
 
 
 class TripletContrastiveModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, temperature=0.07, margin=0.5):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5, temperature=0.07, margin=0.5, heads=1):
         super(TripletContrastiveModel, self).__init__()
-        self.gat_layer = GATLayer(input_dim, hidden_dim)
+        self.gat_layer = GATLayer(input_dim, hidden_dim, heads, dropout)
         self.projector = nn.Linear(hidden_dim, output_dim)
         self.temperature = temperature
         self.margin = margin
@@ -111,15 +125,20 @@ class TripletContrastiveModel(nn.Module):
         return F.normalize(x, dim=1)
 
 class GraphAutoencoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5):
         super(GraphAutoencoder, self).__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.dropout1 = nn.Dropout(p=dropout)
         self.conv2 = GCNConv(hidden_dim, output_dim)
+        self.dropout2 = nn.Dropout(p=dropout)
+
 
     def forward(self, x, edge_index, edge_weight):
         x = self.conv1(x, edge_index)
         x = torch.relu(x)
+        x = self.dropout1(x)
         x = self.conv2(x, edge_index)
+        x = self.dropout2(x)
         return x
 
 def graph_reconstruction_loss(reconstructed_x, x, adj_matrix, edge_weights):
@@ -163,18 +182,40 @@ def triplet_loss(anchor, positive, negative, margin=0.5):
 def merge_embeddings(gae_embedding, other_embedding):
     return torch.cat((gae_embedding, other_embedding), dim=1)
 
+
+EPS = 1e-15
+
+def recon_loss(z: Tensor, pos_edge_index: Tensor,
+                neg_edge_index: Optional[Tensor] = None) -> Tensor:
+    decoder = InnerProductDecoder()
+    pos_pred = decoder(z, pos_edge_index)
+    pos_target = torch.ones_like(pos_pred)
+    pos_loss = F.mse_loss(pos_pred, pos_target)
+
+    if neg_edge_index is None:
+        neg_edge_index = negative_sampling(pos_edge_index, z.size(0))
+
+    neg_pred = decoder(z, neg_edge_index)
+    neg_target = torch.zeros_like(neg_pred)
+    neg_loss = F.mse_loss(neg_pred, neg_target)
+
+    return pos_loss + neg_loss
+
 #parameters
 input_dim = 64
 hidden_dim = 64
 output_dim = 64
-#num_heads = 2
-fused_embedding_size = 64
+num_heads = 1
+fused_embedding_size = 128
+temperature=0.07
+margin=0.5
+dropout_rate = 0.5
 
 #adjacency matrix of edge weights
 #adj_edge_weights = create_weight_adj_matrix(edge_weights_file_category)
 
 #graph reconstruction
-model_graph_reconstruction = GraphAutoencoder(input_dim, hidden_dim, output_dim)
+model_graph_reconstruction = GraphAutoencoder(input_dim, hidden_dim, output_dim, dropout_rate)
 edge_index = extract_edge_index(edge_weights_file_category)
 #edge_weight = extract_normalize_weights(edge_weights_file_category)
 data_edge = pd.read_csv(edge_weights_file_category)
@@ -185,13 +226,13 @@ graph_type = 'category'
 data_graph_reconstruction = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
 
 #contrastive learning
-model_contrastive_learning = TripletContrastiveModel(input_dim, hidden_dim, output_dim)
+model_contrastive_learning = TripletContrastiveModel(input_dim, hidden_dim, output_dim, dropout_rate, temperature, margin, num_heads)
 optimizer = torch.optim.Adam(list(model_graph_reconstruction.parameters()) + list(model_contrastive_learning.parameters()), lr=0.001)
 edge_index = extract_edge_index(edge_weights_file_distance)
 edge_weight = extract_normalize_weights(edge_weights_file_distance)
 graph_type = 'distance'
 data_contrastive_learning = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
-num_epochs = 1000
+num_epochs = 2000
 criterion = nn.MSELoss()
 
 for epoch in range(num_epochs):
@@ -210,14 +251,14 @@ for epoch in range(num_epochs):
     #graph reconstruction
     g_embedding = model_graph_reconstruction(data_graph_reconstruction.x, data_graph_reconstruction.edge_index, data_graph_reconstruction.edge_weight)
     merged_embedding = merge_embeddings(g_embedding, c_embeddings)
-    linear_layer = nn.Linear(g_embedding.shape[1] + c_embeddings.shape[1], fused_embedding_size)
-    fused_embedding = linear_layer(merged_embedding)
-    adjacency_matrix = to_dense_adj(data_graph_reconstruction.edge_index).squeeze()
-    cos_sim = cosine_similarity(fused_embedding.detach().numpy())
-    threshold = 0.7
-    reconstructed_adj_matrix = torch.tensor(cos_sim > threshold, dtype=torch.float32)
+ #   linear_layer = nn.Linear(g_embedding.shape[1] + c_embeddings.shape[1], fused_embedding_size)
+#   fused_embedding = linear_layer(merged_embedding)
+#    adjacency_matrix = to_dense_adj(data_graph_reconstruction.edge_index).squeeze()
+#    cos_sim = cosine_similarity(fused_embedding.detach().numpy())
+#    threshold = 0.7
+#    reconstructed_adj_matrix = torch.tensor(cos_sim > threshold, dtype=torch.float32)
     #reconstructed_adjacency = torch.matmul(merged_embedding, merged_embedding.t())
-    loss = criterion(reconstructed_adj_matrix, adjacency_matrix)
+    loss = recon_loss(merged_embedding, data_graph_reconstruction.edge_index)
     total_loss = loss + combined_loss
 
     #total loss backward
