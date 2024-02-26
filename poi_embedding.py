@@ -22,6 +22,21 @@ edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approac
 poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_1.csv'
 
 
+class SelfAttention(nn.Module):
+    def __init__(self, input_dim, num_heads):
+        super(SelfAttention, self).__init__()
+        self.input_dim = input_dim
+        self.num_heads = num_heads
+
+        self.attention = nn.MultiheadAttention(input_dim, num_heads)
+
+    def forward(self, input):
+        input = input.unsqueeze(0)  
+        output, _ = self.attention(input, input, input)
+        output = output.squeeze(0) 
+        return output 
+
+
 def get_geohash(latitude, longitude, precision=12):
     return geohash2.encode(latitude, longitude, precision=precision)
 
@@ -101,44 +116,46 @@ def generate_data_model(edge_index,edge_weight,poi_file,graph_type):
     return data
 
 class GATLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, heads=1, dropout=0.5):
+    def __init__(self, in_channels, out_channels, heads=2, dropout=0.2):
         super(GATLayer, self).__init__()
         self.conv = GATConv(in_channels, out_channels, heads=heads, dropout=dropout)
 
     def forward(self, x, edge_index, edge_weight):
-        x = self.conv(x, edge_index, edge_weight)
-        return x
+        mask = x != 0.0
+        x_masked = x * mask.float()        
+        x_out = self.conv(x_masked, edge_index, edge_weight)
+        return x_out
 
 
 class TripletContrastiveModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5, temperature=0.07, margin=0.5, heads=1):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, temperature=0.07, margin=0.5, heads=2):
         super(TripletContrastiveModel, self).__init__()
-        self.gat_layer = GATLayer(input_dim, hidden_dim, heads, dropout)
-        self.projector = nn.Linear(hidden_dim, output_dim)
+        self.gat_layer = GATConv(input_dim, hidden_dim, heads=heads, dropout=dropout)
+        self.projector = nn.Linear(heads * hidden_dim, output_dim)
         self.temperature = temperature
         self.margin = margin
 
     def forward(self, data):
-        x = self.gat_layer(data.x, data.edge_index, data.edge_weight)
+        mask = data.x != 0.0000
+        x_masked = data.x * mask.float()
+        x = self.gat_layer(x_masked, data.edge_index, data.edge_weight)
         x = F.relu(x)
-        x = self.projector(x)
+        x = self.projector(x.view(-1, self.gat_layer.out_channels * self.gat_layer.heads))
         return F.normalize(x, dim=1)
 
 class GraphAutoencoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, heads=2):
         super(GraphAutoencoder, self).__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv1 = GATConv(input_dim, hidden_dim, heads=heads, dropout=dropout)
         self.dropout1 = nn.Dropout(p=dropout)
-        self.conv2 = GCNConv(hidden_dim, output_dim)
-        self.dropout2 = nn.Dropout(p=dropout)
+        self.conv2 = GATConv(hidden_dim * heads, output_dim, heads=1, dropout=dropout)  # For the output layer, use heads=1
 
 
     def forward(self, x, edge_index, edge_weight):
-        x = self.conv1(x, edge_index)
+        x = self.conv1(x, edge_index, edge_weight)
         x = torch.relu(x)
         x = self.dropout1(x)
-        x = self.conv2(x, edge_index)
-        x = self.dropout2(x)
+        x = self.conv2(x, edge_index, edge_weight)
         return x
 
 def graph_reconstruction_loss(reconstructed_x, x, adj_matrix, edge_weights):
@@ -183,8 +200,6 @@ def merge_embeddings(gae_embedding, other_embedding):
     return torch.cat((gae_embedding, other_embedding), dim=1)
 
 
-EPS = 1e-15
-
 def recon_loss(z: Tensor, pos_edge_index: Tensor,
                 neg_edge_index: Optional[Tensor] = None) -> Tensor:
     decoder = InnerProductDecoder()
@@ -205,11 +220,11 @@ def recon_loss(z: Tensor, pos_edge_index: Tensor,
 input_dim = 64
 hidden_dim = 64
 output_dim = 64
-num_heads = 1
+num_heads = 2
 fused_embedding_size = 128
 temperature=0.07
 margin=0.5
-dropout_rate = 0.5
+dropout_rate = 0.2
 
 #adjacency matrix of edge weights
 #adj_edge_weights = create_weight_adj_matrix(edge_weights_file_category)
@@ -217,7 +232,6 @@ dropout_rate = 0.5
 #graph reconstruction
 model_graph_reconstruction = GraphAutoencoder(input_dim, hidden_dim, output_dim, dropout_rate)
 edge_index = extract_edge_index(edge_weights_file_category)
-#edge_weight = extract_normalize_weights(edge_weights_file_category)
 data_edge = pd.read_csv(edge_weights_file_category)
 edge_weights_array = data_edge['weight'].values
 edge_weights_array = edge_weights_array.astype(np.float32)
@@ -232,7 +246,7 @@ edge_index = extract_edge_index(edge_weights_file_distance)
 edge_weight = extract_normalize_weights(edge_weights_file_distance)
 graph_type = 'distance'
 data_contrastive_learning = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
-num_epochs = 2000
+num_epochs = 100
 criterion = nn.MSELoss()
 
 for epoch in range(num_epochs):
@@ -251,14 +265,11 @@ for epoch in range(num_epochs):
     #graph reconstruction
     g_embedding = model_graph_reconstruction(data_graph_reconstruction.x, data_graph_reconstruction.edge_index, data_graph_reconstruction.edge_weight)
     merged_embedding = merge_embeddings(g_embedding, c_embeddings)
- #   linear_layer = nn.Linear(g_embedding.shape[1] + c_embeddings.shape[1], fused_embedding_size)
-#   fused_embedding = linear_layer(merged_embedding)
-#    adjacency_matrix = to_dense_adj(data_graph_reconstruction.edge_index).squeeze()
-#    cos_sim = cosine_similarity(fused_embedding.detach().numpy())
-#    threshold = 0.7
-#    reconstructed_adj_matrix = torch.tensor(cos_sim > threshold, dtype=torch.float32)
-    #reconstructed_adjacency = torch.matmul(merged_embedding, merged_embedding.t())
-    loss = recon_loss(merged_embedding, data_graph_reconstruction.edge_index)
+    self_attention = SelfAttention(fused_embedding_size, num_heads)
+    output = self_attention(merged_embedding)
+    linear_layer = nn.Linear(output.shape[1], output_dim)
+    final_node_embeddings = linear_layer(output)
+    loss = recon_loss(final_node_embeddings, data_graph_reconstruction.edge_index)
     total_loss = loss + combined_loss
 
     #total loss backward
