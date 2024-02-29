@@ -15,11 +15,12 @@ from torch import Tensor
 from typing import Optional
 from Module.InnerProductDecoderClass import InnerProductDecoder
 from torch_geometric.utils import negative_sampling
+from torch.utils.tensorboard import SummaryWriter
 
-
+writer = SummaryWriter()
 edge_weights_file_distance = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_distance_edge_weights.csv'
 edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights.csv'
-poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_1.csv'
+poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_4.csv'
 
 
 class SelfAttention(nn.Module):
@@ -36,14 +37,6 @@ class SelfAttention(nn.Module):
         output = output.squeeze(0) 
         return output 
 
-
-def get_geohash(latitude, longitude, precision=12):
-    return geohash2.encode(latitude, longitude, precision=precision)
-
-def char2vec_conversion(words):
-    c2v_model = chars2vec.load_model('eng_50')
-    word_embeddings = c2v_model.vectorize_words(words)
-    return word_embeddings
 
 def create_weight_adj_matrix(edge_file):
     df = pd.read_csv(edge_file)
@@ -116,46 +109,44 @@ def generate_data_model(edge_index,edge_weight,poi_file,graph_type):
     return data
 
 class GATLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, heads=2, dropout=0.2):
+    def __init__(self, in_channels, out_channels, heads=1, dropout=0.2):
         super(GATLayer, self).__init__()
         self.conv = GATConv(in_channels, out_channels, heads=heads, dropout=dropout)
 
-    def forward(self, x, edge_index, edge_weight):
-        mask = x != 0.0
-        x_masked = x * mask.float()        
-        x_out = self.conv(x_masked, edge_index, edge_weight)
+    def forward(self, x, edge_index, edge_weight):   
+        x_out = self.conv(x, edge_index, edge_weight)
         return x_out
 
 
 class TripletContrastiveModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, temperature=0.07, margin=0.5, heads=2):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, temperature=0.07, margin=0.5, heads=1):
         super(TripletContrastiveModel, self).__init__()
-        self.gat_layer = GATConv(input_dim, hidden_dim, heads=heads, dropout=dropout)
-        self.projector = nn.Linear(heads * hidden_dim, output_dim)
+        self.gat_layer = GATLayer(input_dim, hidden_dim, heads, dropout)
+        self.projector = nn.Linear(hidden_dim, output_dim)
         self.temperature = temperature
         self.margin = margin
 
     def forward(self, data):
-        mask = data.x != 0.0000
-        x_masked = data.x * mask.float()
-        x = self.gat_layer(x_masked, data.edge_index, data.edge_weight)
+        x = self.gat_layer(data.x, data.edge_index, data.edge_weight)
         x = F.relu(x)
-        x = self.projector(x.view(-1, self.gat_layer.out_channels * self.gat_layer.heads))
+        x = self.projector(x)
         return F.normalize(x, dim=1)
 
 class GraphAutoencoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, heads=2):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2):
         super(GraphAutoencoder, self).__init__()
-        self.conv1 = GATConv(input_dim, hidden_dim, heads=heads, dropout=dropout)
+        self.conv1 = GCNConv(input_dim, hidden_dim)
         self.dropout1 = nn.Dropout(p=dropout)
-        self.conv2 = GATConv(hidden_dim * heads, output_dim, heads=1, dropout=dropout)  # For the output layer, use heads=1
+        self.conv2 = GCNConv(hidden_dim, output_dim)
+        self.dropout2 = nn.Dropout(p=dropout)
 
 
     def forward(self, x, edge_index, edge_weight):
-        x = self.conv1(x, edge_index, edge_weight)
+        x = self.conv1(x, edge_index)
         x = torch.relu(x)
         x = self.dropout1(x)
-        x = self.conv2(x, edge_index, edge_weight)
+        x = self.conv2(x, edge_index)
+        x = self.dropout2(x)
         return x
 
 def graph_reconstruction_loss(reconstructed_x, x, adj_matrix, edge_weights):
@@ -220,7 +211,7 @@ def recon_loss(z: Tensor, pos_edge_index: Tensor,
 input_dim = 64
 hidden_dim = 64
 output_dim = 64
-num_heads = 2
+num_heads = 1
 fused_embedding_size = 128
 temperature=0.07
 margin=0.5
@@ -246,7 +237,7 @@ edge_index = extract_edge_index(edge_weights_file_distance)
 edge_weight = extract_normalize_weights(edge_weights_file_distance)
 graph_type = 'distance'
 data_contrastive_learning = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
-num_epochs = 100
+num_epochs = 200
 criterion = nn.MSELoss()
 
 for epoch in range(num_epochs):
@@ -267,10 +258,14 @@ for epoch in range(num_epochs):
     merged_embedding = merge_embeddings(g_embedding, c_embeddings)
     self_attention = SelfAttention(fused_embedding_size, num_heads)
     output = self_attention(merged_embedding)
-    linear_layer = nn.Linear(output.shape[1], output_dim)
-    final_node_embeddings = linear_layer(output)
-    loss = recon_loss(final_node_embeddings, data_graph_reconstruction.edge_index)
+    #linear_layer = nn.Linear(output.shape[1], output_dim)
+    #final_node_embeddings = linear_layer(output)
+    loss = recon_loss(output, data_graph_reconstruction.edge_index)
     total_loss = loss + combined_loss
+
+    writer.add_scalar('Loss/Contrastive', combined_loss, epoch)
+    writer.add_scalar('Loss/Reconstruction', loss, epoch)
+    writer.add_scalar('Loss/CombinedLoss', total_loss, epoch)
 
     #total loss backward
     total_loss.backward()
