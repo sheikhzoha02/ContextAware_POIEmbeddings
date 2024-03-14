@@ -16,12 +16,19 @@ from typing import Optional
 from Module.InnerProductDecoderClass import InnerProductDecoder
 from torch_geometric.utils import negative_sampling
 from torch.utils.tensorboard import SummaryWriter
+from Module.set_transformer import PMA
+from torch.nn.utils import clip_grad_norm_
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+import pytorch_warmup as warmup
+
+
 
 writer = SummaryWriter()
 edge_weights_file_distance = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_distance_edge_weights.csv'
-edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights.csv'
-poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_4.csv'
-
+edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights_1.csv'
+poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_5_word2vec.csv'
+EPS = 1e-15
 
 class SelfAttention(nn.Module):
     def __init__(self, input_dim, num_heads):
@@ -104,33 +111,44 @@ def generate_data_model(edge_index,edge_weight,poi_file,graph_type):
         padding = np.zeros((node_features.shape[0], desired_dimensions - num_features))
         node_features = np.concatenate((node_features, padding), axis=1)
         node_features = torch.tensor(node_features, dtype=torch.float)
-
+    
     data = Data(x=node_features, edge_index=edge_index, edge_weight=edge_weight)
     return data
 
-class GATLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, heads=1, dropout=0.2):
-        super(GATLayer, self).__init__()
-        self.conv = GATConv(in_channels, out_channels, heads=heads, dropout=dropout)
+class TripletGNN(nn.Module):
+    def __init__(self, num_features, hidden_dim, output_dim):
+        super(TripletGNN, self).__init__()
+        self.gcn1 = GCNConv(num_features, hidden_dim)
+        self.gcn2 = GCNConv(hidden_dim, output_dim)
 
-    def forward(self, x, edge_index, edge_weight):   
-        x_out = self.conv(x, edge_index, edge_weight)
-        return x_out
+    def forward(self, x, edge_index, edge_weight=None):
+        x = self.gcn1(x, edge_index, edge_weight=edge_weight)
+        x = torch.relu(x)
+        x = self.gcn2(x, edge_index, edge_weight=edge_weight)
+        return x
 
+class TripletNetwork(nn.Module):
+    def __init__(self, num_features, hidden_dim, output_dim):
+        super(TripletNetwork, self).__init__()
+        self.gnn = TripletGNN(num_features, hidden_dim, output_dim)
 
-class TripletContrastiveModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, temperature=0.07, margin=0.5, heads=1):
-        super(TripletContrastiveModel, self).__init__()
-        self.gat_layer = GATLayer(input_dim, hidden_dim, heads, dropout)
-        self.projector = nn.Linear(hidden_dim, output_dim)
-        self.temperature = temperature
+    def forward(self, anchor, positive, negative):
+        anchor_embedding = self.gnn(anchor.x, anchor.edge_index, edge_weight=anchor.edge_attr)
+        positive_embedding = self.gnn(positive.x, positive.edge_index, edge_weight=positive.edge_attr)
+        negative_embedding = self.gnn(negative.x, negative.edge_index, edge_weight=negative.edge_attr)
+        return anchor_embedding, positive_embedding, negative_embedding
+
+class TripletLoss(nn.Module):
+    def __init__(self, margin=1.0):
+        super(TripletLoss, self).__init__()
         self.margin = margin
 
-    def forward(self, data):
-        x = self.gat_layer(data.x, data.edge_index, data.edge_weight)
-        x = F.relu(x)
-        x = self.projector(x)
-        return F.normalize(x, dim=1)
+    def forward(self, anchor, positive, negative):
+        distance_positive = torch.norm(anchor - positive, p=2, dim=1)
+        distance_negative = torch.norm(anchor - negative, p=2, dim=1)
+        loss = torch.relu(distance_positive - distance_negative + self.margin)
+        return torch.mean(loss)
+
 
 class GraphAutoencoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2):
@@ -142,36 +160,12 @@ class GraphAutoencoder(nn.Module):
 
 
     def forward(self, x, edge_index, edge_weight):
-        x = self.conv1(x, edge_index)
+        x = self.conv1(x, edge_index, edge_weight)
         x = torch.relu(x)
         x = self.dropout1(x)
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x, edge_index, edge_weight)
         x = self.dropout2(x)
         return x
-
-def graph_reconstruction_loss(reconstructed_x, x, adj_matrix, edge_weights):
-    adj_matrix = adj_matrix.to(torch.float32)
-    cos_sim = cosine_similarity(reconstructed_x.detach().numpy())
-    threshold = 0.7
-#    reconstructed_adj_matrix = reconstructed_x.matmul(reconstructed_x.t())
-    reconstructed_adj_matrix = torch.tensor(cos_sim > threshold, dtype=torch.float32)
-    reconstructed_adj_matrix = reconstructed_adj_matrix * edge_weights
-    adjacency_loss = F.mse_loss(reconstructed_adj_matrix, adj_matrix)
-    feature_loss = F.mse_loss(reconstructed_x, x)
-    return adjacency_loss + feature_loss
-
-
-def contrastive_loss(embeddings, temperature=0.07):
-    batch_size = embeddings.size(0)
-    sim_matrix = torch.matmul(embeddings, embeddings.T) / temperature
-    sim_matrix = sim_matrix - torch.eye(batch_size).to(embeddings.device) * 1e9
-    
-    positive_pairs = torch.diag(sim_matrix, diagonal=1)
-    negative_pairs = torch.logsumexp(sim_matrix, dim=1)
-    combined_pairs = torch.cat((positive_pairs, negative_pairs), dim=0)
-    loss = F.cross_entropy(combined_pairs[2:],
-                           torch.zeros(batch_size).long().to(embeddings.device).type(torch.FloatTensor) )
-    return loss
 
 
 def get_triplets(embeddings):
@@ -179,12 +173,6 @@ def get_triplets(embeddings):
     indices = torch.randint(0, num_samples, (3,))
     anchor, positive, negative = embeddings[indices[0]], embeddings[indices[1]], embeddings[indices[2]]
     return anchor, positive, negative
-
-def triplet_loss(anchor, positive, negative, margin=0.5):
-    distance_positive = F.pairwise_distance(anchor, positive)
-    distance_negative = F.pairwise_distance(anchor, negative)
-    loss = F.relu(distance_positive - distance_negative + margin)
-    return torch.mean(loss)
 
 
 def merge_embeddings(gae_embedding, other_embedding):
@@ -207,18 +195,16 @@ def recon_loss(z: Tensor, pos_edge_index: Tensor,
 
     return pos_loss + neg_loss
 
+
 #parameters
 input_dim = 64
-hidden_dim = 64
+hidden_dim = 32
 output_dim = 64
-num_heads = 1
+num_heads = 4
 fused_embedding_size = 128
-temperature=0.07
-margin=0.5
+margin=1.0
 dropout_rate = 0.2
-
-#adjacency matrix of edge weights
-#adj_edge_weights = create_weight_adj_matrix(edge_weights_file_category)
+max_norm = 0.9
 
 #graph reconstruction
 model_graph_reconstruction = GraphAutoencoder(input_dim, hidden_dim, output_dim, dropout_rate)
@@ -231,52 +217,107 @@ graph_type = 'category'
 data_graph_reconstruction = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
 
 #contrastive learning
-model_contrastive_learning = TripletContrastiveModel(input_dim, hidden_dim, output_dim, dropout_rate, temperature, margin, num_heads)
-optimizer = torch.optim.Adam(list(model_graph_reconstruction.parameters()) + list(model_contrastive_learning.parameters()), lr=0.001)
+data_poi = pd.read_csv(poi_file)
+data_list = [ast.literal_eval(s) for s in data_poi['geohash_embedding'].values]
+numpy_data = np.array(data_list, dtype=np.float32)
+node_features = torch.tensor(numpy_data)
+desired_dimensions = 64
+num_features = node_features.shape[1]
+if num_features < desired_dimensions:
+    padding = np.zeros((node_features.shape[0], desired_dimensions - num_features))
+    node_features = np.concatenate((node_features, padding), axis=1)
+    node_features = torch.tensor(node_features, dtype=torch.float)
+
+
 edge_index = extract_edge_index(edge_weights_file_distance)
 edge_weight = extract_normalize_weights(edge_weights_file_distance)
-graph_type = 'distance'
-data_contrastive_learning = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
-num_epochs = 200
+
+model_contrastive_learning = TripletNetwork(64, 32, output_dim)
+triplet_loss_fn = TripletLoss(margin)
+
+num_chunks = 3
+chunked_tensors = torch.chunk(node_features, num_chunks, dim=0)
+x_anchor, x_positive, x_negative = chunked_tensors
+source_node_start = 0
+target_node_start = 0
+source_node_limit = 13895
+target_node_limit = 13895
+filtered_edges_mask = ((edge_index[0] >= source_node_start) & (edge_index[0] <= source_node_limit) &
+                       (edge_index[1] >= target_node_start) & (edge_index[1] <= target_node_limit))
+
+filtered_edge_index_anchor = edge_index[:, filtered_edges_mask]
+filtered_edge_weights_anchor = edge_weight[filtered_edges_mask]
+
+anchor_data = Data(x=x_anchor, edge_index=filtered_edge_index_anchor, edge_attr=filtered_edge_weights_anchor)
+
+source_node_start = 13896
+target_node_start = 13896
+source_node_limit = 27791
+target_node_limit = 27791
+filtered_edges_mask = ((edge_index[0] >= source_node_start) & (edge_index[0] <= source_node_limit) &
+                       (edge_index[1] >= target_node_start) & (edge_index[1] <= target_node_limit))
+
+filtered_edge_index_positive = edge_index[:, filtered_edges_mask]
+filtered_edge_weights_positive = edge_weight[filtered_edges_mask]
+filtered_edge_index_positive = filtered_edge_index_positive - 13896
+positive_data = Data(x=x_positive, edge_index=filtered_edge_index_positive, edge_attr=filtered_edge_weights_positive)
+
+source_node_start = 27792
+target_node_start = 27792
+source_node_limit = 41688
+target_node_limit = 41688
+filtered_edges_mask = ((edge_index[0] >= source_node_start) & (edge_index[0] <= source_node_limit) &
+                       (edge_index[1] >= target_node_start) & (edge_index[1] <= target_node_limit))
+
+filtered_edge_index_negative = edge_index[:, filtered_edges_mask]
+filtered_edge_weights_negative = edge_weight[filtered_edges_mask]
+filtered_edge_index_negative = filtered_edge_index_negative - 27792
+
+negative_data = Data(x=x_negative, edge_index=filtered_edge_index_negative, edge_attr=filtered_edge_weights_negative)
+optimizer = optim.Adam(list(model_graph_reconstruction.parameters()) + list(model_contrastive_learning.parameters()), lr=0.006)
+#scheduler = StepLR(optimizer, step_size=1, gamma=1, verbose=False)
+#warmup_scheduler = warmup.LinearWarmup(optimizer, 40)
+
+num_epochs = 2000
 criterion = nn.MSELoss()
 
 for epoch in range(num_epochs):
-    #losses = []
-
     optimizer.zero_grad()
 
     #contrastive loss
-    c_embeddings = model_contrastive_learning(data_contrastive_learning)
-    anchor, positive, negative = get_triplets(c_embeddings)
-    loss_triplet = triplet_loss(anchor, positive, negative)
-    poi_embeddings = torch.stack([anchor, positive, negative])
-    loss_contrastive = contrastive_loss(poi_embeddings)
-    combined_loss = loss_triplet + loss_contrastive
+    anchor_embedding, positive_embedding, negative_embedding = model_contrastive_learning(anchor_data, positive_data, negative_data)
+    c_embedding = torch.cat([anchor_embedding, positive_embedding, negative_embedding])
+    loss_triplet = triplet_loss_fn(anchor_embedding, positive_embedding, negative_embedding)
     
     #graph reconstruction
     g_embedding = model_graph_reconstruction(data_graph_reconstruction.x, data_graph_reconstruction.edge_index, data_graph_reconstruction.edge_weight)
-    merged_embedding = merge_embeddings(g_embedding, c_embeddings)
+    merged_embedding = merge_embeddings(g_embedding, c_embedding)
     self_attention = SelfAttention(fused_embedding_size, num_heads)
     output = self_attention(merged_embedding)
-    #linear_layer = nn.Linear(output.shape[1], output_dim)
-    #final_node_embeddings = linear_layer(output)
-    loss = recon_loss(output, data_graph_reconstruction.edge_index)
-    total_loss = loss + combined_loss
+    linear_layer = nn.Linear(merged_embedding.shape[1], output_dim)
+    final_node_embeddings = linear_layer(output)
+    loss = recon_loss(final_node_embeddings, data_graph_reconstruction.edge_index)
+    total_loss = loss + loss_triplet
 
-    writer.add_scalar('Loss/Contrastive', combined_loss, epoch)
-    writer.add_scalar('Loss/Reconstruction', loss, epoch)
+    print('triplet loss')
+    print(loss_triplet.item())
+    print('recon loss')
+    print(loss.item())
+
+    writer.add_scalar('Loss/Contrastive', loss_triplet, epoch)
+    writer.add_scalar('Loss/Reconstruction', loss.item(), epoch)
     writer.add_scalar('Loss/CombinedLoss', total_loss, epoch)
 
     #total loss backward
     total_loss.backward()
+#    clip_grad_norm_(list(model_graph_reconstruction.parameters()) + list(model_contrastive_learning.parameters()), max_norm=max_norm)
     optimizer.step()
+#    with warmup_scheduler.dampening():
+#        scheduler.step()
 
     if epoch % 5 == 0:
-        print(f"Epoch [{epoch}/{num_epochs}], Loss: {total_loss}")
+        print(f"Epoch [{epoch}/{num_epochs}], Loss: {total_loss.item()}")
 
-#change the fusion strategy
-#change the min max normalization of distances
-#change the adjacency matrix to list (scalabilty)
-#use more features name,rating, opening hours
+
 optimized_embeddings = model_graph_reconstruction(data_graph_reconstruction.x, data_graph_reconstruction.edge_index, data_graph_reconstruction.edge_weight)
-torch.save(optimized_embeddings, "poi_embedding_nyc.tensor")
+torch.save(optimized_embeddings, "poi_embedding_nyc_2000_TCL_final_no_scheduler_with_weight_different_recon.tensor")
