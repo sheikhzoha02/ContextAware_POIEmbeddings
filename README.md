@@ -1,4 +1,4 @@
-The files 'nyc_category_edge_weights_1.csv', 'nyc_distance_edge_weights.csv' and 'nyc_data.pkl' already added in the shared Data folder in Drive.
+The files 'nyc_category_edge_weights_1.csv', 'nyc_distance_edge_weights.csv', 'poi_tags_embeddings_nyc_300.tensor' and 'nyc_data.pkl' already added in the shared Data folder in Drive.
 Sequence of Commands:
 1. python poi_embedding.py
 2. python poi_region_embedding.py
