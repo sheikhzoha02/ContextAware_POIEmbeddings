@@ -26,7 +26,7 @@ import pytorch_warmup as warmup
 
 writer = SummaryWriter()
 edge_weights_file_distance = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_distance_edge_weights.csv'
-edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights_1.csv'
+edge_weights_file_category = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/nyc_category_edge_weights_similarity.csv'
 poi_file = '/home/iailab41/sheikhz0/POI-Embeddings-Own-Approach/Data/NYC/output_with_embeddings_5_word2vec.csv'
 EPS = 1e-15
 
@@ -91,27 +91,10 @@ def normalize_edge_weights(edge_weights_array):
     return edge_weight
 
 
-def generate_data_model(edge_index,edge_weight,poi_file,graph_type):
+def generate_data_model(edge_index,edge_weight,poi_file):
     data_poi = pd.read_csv(poi_file)
-    if graph_type == 'category':
-        data_list_fclass = [ast.literal_eval(s) for s in data_poi['fclass_embedding'].values]
-        numpy_data_fclass = np.array(data_list_fclass, dtype=np.float32)
-        data_list_1stlevel = [ast.literal_eval(s) for s in data_poi['1stlevel_embedding'].values]
-        numpy_data_1stlevel = np.array(data_list_1stlevel, dtype=np.float32)
-        numpy_data = np.concatenate((numpy_data_fclass, numpy_data_1stlevel), axis=1)
-        node_features = torch.tensor(numpy_data, dtype=torch.float)
-    elif graph_type == 'distance':
-        data_list = [ast.literal_eval(s) for s in data_poi['geohash_embedding'].values]
-        numpy_data = np.array(data_list, dtype=np.float32)
-        node_features = torch.tensor(numpy_data)
-
-    desired_dimensions = 64
-    num_features = node_features.shape[1]
-    if num_features < desired_dimensions:
-        padding = np.zeros((node_features.shape[0], desired_dimensions - num_features))
-        node_features = np.concatenate((node_features, padding), axis=1)
-        node_features = torch.tensor(node_features, dtype=torch.float)
-    
+    loaded_tags_embeddings = torch.load("/home/iailab41/sheikhz0/GeoVectors/embeddings_tags/poi_tags_embeddings_nyc_300.tensor")
+    node_features = torch.tensor(loaded_tags_embeddings, dtype=torch.float)
     data = Data(x=node_features, edge_index=edge_index, edge_weight=edge_weight)
     return data
 
@@ -197,11 +180,11 @@ def recon_loss(z: Tensor, pos_edge_index: Tensor,
 
 
 #parameters
-input_dim = 64
-hidden_dim = 32
-output_dim = 64
+input_dim = 300
+hidden_dim = 150
+output_dim = 300
 num_heads = 4
-fused_embedding_size = 128
+fused_embedding_size = 364
 margin=1.0
 dropout_rate = 0.2
 max_norm = 0.9
@@ -213,8 +196,7 @@ data_edge = pd.read_csv(edge_weights_file_category)
 edge_weights_array = data_edge['weight'].values
 edge_weights_array = edge_weights_array.astype(np.float32)
 edge_weight = torch.tensor(edge_weights_array).to(torch.float32)
-graph_type = 'category'
-data_graph_reconstruction = generate_data_model(edge_index,edge_weight,poi_file,graph_type)
+data_graph_reconstruction = generate_data_model(edge_index,edge_weight,poi_file)
 
 #contrastive learning
 data_poi = pd.read_csv(poi_file)
@@ -232,7 +214,7 @@ if num_features < desired_dimensions:
 edge_index = extract_edge_index(edge_weights_file_distance)
 edge_weight = extract_normalize_weights(edge_weights_file_distance)
 
-model_contrastive_learning = TripletNetwork(64, 32, output_dim)
+model_contrastive_learning = TripletNetwork(64, 32, 64)
 triplet_loss_fn = TripletLoss(margin)
 
 num_chunks = 3
@@ -275,8 +257,6 @@ filtered_edge_index_negative = filtered_edge_index_negative - 27792
 
 negative_data = Data(x=x_negative, edge_index=filtered_edge_index_negative, edge_attr=filtered_edge_weights_negative)
 optimizer = optim.Adam(list(model_graph_reconstruction.parameters()) + list(model_contrastive_learning.parameters()), lr=0.006)
-#scheduler = StepLR(optimizer, step_size=1, gamma=1, verbose=False)
-#warmup_scheduler = warmup.LinearWarmup(optimizer, 40)
 
 num_epochs = 2000
 criterion = nn.MSELoss()
@@ -308,16 +288,12 @@ for epoch in range(num_epochs):
     writer.add_scalar('Loss/Reconstruction', loss.item(), epoch)
     writer.add_scalar('Loss/CombinedLoss', total_loss, epoch)
 
-    #total loss backward
     total_loss.backward()
-#    clip_grad_norm_(list(model_graph_reconstruction.parameters()) + list(model_contrastive_learning.parameters()), max_norm=max_norm)
     optimizer.step()
-#    with warmup_scheduler.dampening():
-#        scheduler.step()
 
     if epoch % 5 == 0:
         print(f"Epoch [{epoch}/{num_epochs}], Loss: {total_loss.item()}")
 
 
 optimized_embeddings = model_graph_reconstruction(data_graph_reconstruction.x, data_graph_reconstruction.edge_index, data_graph_reconstruction.edge_weight)
-torch.save(optimized_embeddings, "poi_embedding_nyc_2000_TCL_final_no_scheduler_with_weight_different_recon.tensor")
+torch.save(optimized_embeddings, "poi_embedding_tags_update_1.tensor")
