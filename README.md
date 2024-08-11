@@ -12,6 +12,6 @@ python Downstream_tasks/population_density.py
 ```
 
 The system architecture of multi-task and context-aware POI embeddings:
-![Database](architecture.jpg)
+![Database](architecture.png)
 
 Data and groudtruth files are not uploaded in the repository which can be requested via email sheikh.zoha90@gmail.com.
